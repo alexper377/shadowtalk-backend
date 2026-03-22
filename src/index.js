@@ -88,6 +88,10 @@ async function initDB() {
       );
       -- Add reply columns if they don't exist (for existing tables)
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id UUID;
+      ALTER TABLE conversations ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_data TEXT;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name TEXT;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_size INTEGER;
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_content TEXT;
       ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_user TEXT;
       CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, created_at DESC);
