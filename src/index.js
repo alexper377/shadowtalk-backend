@@ -8,17 +8,17 @@ const bcrypt     = require('bcryptjs');
 const jwt        = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const path       = require('path');
- 
+
 const PORT       = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'shadowtalk-secret';
 const CLIENT_URL = process.env.CLIENT_URL || '*';
 const MAX_FILE_MB = 20;
- 
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
- 
+
 const app    = express();
 const server = http.createServer(app);
 const io     = new Server(server, {
@@ -26,10 +26,11 @@ const io     = new Server(server, {
   pingTimeout: 60000,
   maxHttpBufferSize: MAX_FILE_MB * 1024 * 1024,
 });
- 
+
 app.use(cors({ origin: CLIENT_URL }));
+app.set('io', io);
 app.use(express.json({ limit: `${MAX_FILE_MB}mb` }));
- 
+
 // ─── DB INIT ───
 async function initDB() {
   const client = await pool.connect();
@@ -75,13 +76,20 @@ async function initDB() {
         conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
         sender_id       UUID REFERENCES users(id) ON DELETE SET NULL,
         content         TEXT NOT NULL DEFAULT '',
-        type            TEXT NOT NULL DEFAULT 'text' CHECK(type IN ('text','image','file','audio','system','call')),
+        type            TEXT NOT NULL DEFAULT 'text' CHECK(type IN ('text','image','file','audio','system','call','deleted')),
         file_name       TEXT,
         file_size       INTEGER,
         file_data       TEXT,
+        reply_to_id     UUID,
+        reply_to_content TEXT,
+        reply_to_user   TEXT,
         is_read         BOOLEAN NOT NULL DEFAULT false,
         created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      -- Add reply columns if they don't exist (for existing tables)
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id UUID;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_content TEXT;
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_user TEXT;
       CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_members_user ON conversation_members(user_id);
       CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
@@ -90,7 +98,7 @@ async function initDB() {
     console.log('✅ Database initialized');
   } finally { client.release(); }
 }
- 
+
 // ─── AUTH MIDDLEWARE ───
 function auth(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
@@ -101,7 +109,7 @@ function auth(req, res, next) {
 function makeToken(user) {
   return jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
 }
- 
+
 // ─── AUTH ───
 app.post('/api/auth/register', async (req, res) => {
   const { username, display_name, password } = req.body;
@@ -122,7 +130,7 @@ app.post('/api/auth/register', async (req, res) => {
     res.json({ user: rows[0], token: makeToken(rows[0]) });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
- 
+
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
@@ -135,7 +143,7 @@ app.post('/api/auth/login', async (req, res) => {
     res.json({ user: rows[0], token: makeToken(rows[0]) });
   } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
- 
+
 app.get('/api/auth/me', auth, async (req, res) => {
   const { rows } = await pool.query(
     'SELECT id,username,display_name,avatar_color,bio,is_online,last_seen,created_at FROM users WHERE id=$1',
@@ -144,7 +152,7 @@ app.get('/api/auth/me', auth, async (req, res) => {
   if (!rows.length) return res.status(404).json({ error: 'Not found' });
   res.json(rows[0]);
 });
- 
+
 // ─── USERS ───
 app.get('/api/users/search', auth, async (req, res) => {
   const q = (req.query.q||'').trim();
@@ -157,12 +165,12 @@ app.get('/api/users/search', auth, async (req, res) => {
   );
   res.json(rows);
 });
- 
+
 app.get('/api/users/check/:username', async (req, res) => {
   const { rows } = await pool.query('SELECT id FROM users WHERE username=$1', [req.params.username]);
   res.json({ available: rows.length === 0 });
 });
- 
+
 // ─── FRIENDS ───
 app.get('/api/friends', auth, async (req, res) => {
   const { rows } = await pool.query(`
@@ -176,7 +184,7 @@ app.get('/api/friends', auth, async (req, res) => {
   `, [req.user.id]);
   res.json(rows);
 });
- 
+
 app.post('/api/friends/request', auth, async (req, res) => {
   const { user_id } = req.body;
   if (!user_id || user_id === req.user.id) return res.status(400).json({ error: 'Invalid' });
@@ -193,7 +201,7 @@ app.post('/api/friends/request', auth, async (req, res) => {
     res.json({ friendship: rows[0] });
   } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
- 
+
 app.post('/api/friends/accept', auth, async (req, res) => {
   const { friendship_id } = req.body;
   const { rows } = await pool.query(
@@ -203,7 +211,7 @@ app.post('/api/friends/accept', auth, async (req, res) => {
   if (!rows.length) return res.status(404).json({ error: 'Not found' });
   res.json({ friendship: rows[0] });
 });
- 
+
 app.delete('/api/friends/:id', auth, async (req, res) => {
   await pool.query(
     'DELETE FROM friendships WHERE id=$1 AND (user_id=$2 OR friend_id=$2)',
@@ -211,7 +219,7 @@ app.delete('/api/friends/:id', auth, async (req, res) => {
   );
   res.json({ ok: true });
 });
- 
+
 // ─── CONVERSATIONS ───
 app.get('/api/conversations', auth, async (req, res) => {
   try {
@@ -235,7 +243,7 @@ app.get('/api/conversations', auth, async (req, res) => {
     res.json(rows);
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
- 
+
 app.post('/api/conversations/direct', auth, async (req, res) => {
   const { user_id } = req.body;
   if (!user_id) return res.status(400).json({ error: 'user_id required' });
@@ -258,7 +266,7 @@ app.post('/api/conversations/direct', auth, async (req, res) => {
   } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'Server error' }); }
   finally { client.release(); }
 });
- 
+
 app.post('/api/conversations/group', auth, async (req, res) => {
   const { name, description, member_ids } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
@@ -284,7 +292,7 @@ app.post('/api/conversations/group', auth, async (req, res) => {
   } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'Server error' }); }
   finally { client.release(); }
 });
- 
+
 // ─── MESSAGES ───
 app.get('/api/messages/:convId', auth, async (req, res) => {
   const { convId } = req.params;
@@ -292,7 +300,7 @@ app.get('/api/messages/:convId', auth, async (req, res) => {
   try {
     const mem = await pool.query('SELECT 1 FROM conversation_members WHERE conversation_id=$1 AND user_id=$2', [convId, req.user.id]);
     if (!mem.rows.length) return res.status(403).json({ error: 'Not a member' });
-    let q = `SELECT m.id,m.content,m.type,m.file_name,m.file_size,m.file_data,m.is_read,m.created_at,m.sender_id,
+    let q = `SELECT m.id,m.content,m.type,m.file_name,m.file_size,m.file_data,m.reply_to_id,m.reply_to_content,m.reply_to_user,m.is_read,m.created_at,m.sender_id,
              u.username,u.display_name,u.avatar_color
              FROM messages m LEFT JOIN users u ON u.id=m.sender_id
              WHERE m.conversation_id=$1`;
@@ -304,28 +312,50 @@ app.get('/api/messages/:convId', auth, async (req, res) => {
     res.json(rows);
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
- 
+
+// ─── FILE UPLOAD ───
+app.post('/api/messages/upload', auth, async (req, res) => {
+  const { conversation_id, type, file_name, file_size, file_data, content } = req.body;
+  if (!conversation_id || !file_data) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const mem = await pool.query('SELECT 1 FROM conversation_members WHERE conversation_id=$1 AND user_id=$2', [conversation_id, req.user.id]);
+    if (!mem.rows.length) return res.status(403).json({ error: 'Not a member' });
+    const { rows } = await pool.query(
+      `INSERT INTO messages(conversation_id,sender_id,content,type,file_name,file_size,file_data)
+       VALUES($1,$2,$3,$4,$5,$6,$7)
+       RETURNING id,conversation_id,sender_id,content,type,file_name,file_size,file_data,reply_to_id,reply_to_content,reply_to_user,is_read,created_at`,
+      [conversation_id, req.user.id, content||'', type||'file', file_name||null, file_size||null, file_data]
+    );
+    const msg = rows[0];
+    const { rows: sr } = await pool.query('SELECT username,display_name,avatar_color FROM users WHERE id=$1', [req.user.id]);
+    const full = { ...msg, ...sr[0] };
+    const io_instance = req.app.get('io');
+    if (io_instance) io_instance.to(conversation_id).emit('message:new', full);
+    res.json({ ok: true, message: full });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
 // ─── SOCKET.IO ───
 const onlineUsers = new Map();
- 
+
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
   if (!token) return next(new Error('No token'));
   try { socket.user = jwt.verify(token, JWT_SECRET); next(); }
   catch { next(new Error('Invalid token')); }
 });
- 
+
 io.on('connection', async (socket) => {
   const userId = socket.user.id;
   console.log(`🔌 Connected: ${socket.user.username}`);
   onlineUsers.set(userId, socket.id);
   await pool.query('UPDATE users SET is_online=true WHERE id=$1', [userId]);
   io.emit('user:online', { userId, online: true });
- 
+
   // Join rooms
   const { rows: convs } = await pool.query('SELECT conversation_id FROM conversation_members WHERE user_id=$1', [userId]);
   convs.forEach(c => socket.join(c.conversation_id));
- 
+
   // ── SEND MESSAGE ──
   socket.on('message:send', async (data, ack) => {
     if (!data?.conversation_id) return;
@@ -334,11 +364,12 @@ io.on('connection', async (socket) => {
     try {
       const mem = await pool.query('SELECT 1 FROM conversation_members WHERE conversation_id=$1 AND user_id=$2', [conversation_id, userId]);
       if (!mem.rows.length) return;
+      const { reply_to_id, reply_to_content, reply_to_user } = data;
       const { rows } = await pool.query(
-        `INSERT INTO messages(conversation_id,sender_id,content,type,file_name,file_size,file_data)
-         VALUES($1,$2,$3,$4,$5,$6,$7)
-         RETURNING id,conversation_id,sender_id,content,type,file_name,file_size,file_data,is_read,created_at`,
-        [conversation_id, userId, content||'', type, file_name||null, file_size||null, file_data||null]
+        `INSERT INTO messages(conversation_id,sender_id,content,type,file_name,file_size,file_data,reply_to_id,reply_to_content,reply_to_user)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         RETURNING id,conversation_id,sender_id,content,type,file_name,file_size,file_data,reply_to_id,reply_to_content,reply_to_user,is_read,created_at`,
+        [conversation_id, userId, content||'', type, file_name||null, file_size||null, file_data||null, reply_to_id||null, reply_to_content||null, reply_to_user||null]
       );
       const msg = rows[0];
       const { rows: sr } = await pool.query('SELECT username,display_name,avatar_color FROM users WHERE id=$1', [userId]);
@@ -347,7 +378,7 @@ io.on('connection', async (socket) => {
       if (ack) ack({ ok: true, message: full });
     } catch(e) { console.error('message:send error', e); if(ack) ack({ok:false}); }
   });
- 
+
   // ── TYPING ──
   socket.on('typing:start', (data) => {
     if (!data?.conversation_id) return;
@@ -359,20 +390,20 @@ io.on('connection', async (socket) => {
     if (!data?.conversation_id) return;
     socket.to(data.conversation_id).emit('typing:stop', { conversation_id: data.conversation_id, userId });
   });
- 
+
   // ── READ ──
   socket.on('messages:read', async (data) => {
     if (!data?.conversation_id) return;
     await pool.query('UPDATE messages SET is_read=true WHERE conversation_id=$1 AND sender_id!=$2 AND is_read=false', [data.conversation_id, userId]);
     socket.to(data.conversation_id).emit('messages:read', { conversation_id: data.conversation_id, userId });
   });
- 
+
   // ── JOIN ROOM ──
   socket.on('conversation:join', (data) => {
     if (!data?.conversation_id) return;
     socket.join(data.conversation_id);
   });
- 
+
   // ── WEBRTC CALL SIGNALING ──
   socket.on('call:offer', (data) => {
     if (!data?.conversation_id) return;
@@ -394,7 +425,7 @@ io.on('connection', async (socket) => {
     if (!data?.conversation_id) return;
     socket.to(data.conversation_id).emit('call:reject', { from: userId });
   });
- 
+
   // ── DISCONNECT ──
   socket.on('disconnect', async () => {
     console.log(`❌ Disconnected: ${socket.user.username}`);
@@ -403,10 +434,45 @@ io.on('connection', async (socket) => {
     io.emit('user:online', { userId, online: false, last_seen: new Date() });
   });
 });
- 
+
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
- 
+
 initDB().then(() => {
   server.listen(PORT, () => console.log(`🚀 ShadowTalk backend on port ${PORT}`));
 }).catch(e => { console.error('DB init failed:', e); process.exit(1); });
- 
+
+// ─── DELETE MESSAGE ───
+app.delete('/api/messages/:msgId', auth, async (req, res) => {
+  const { msgId } = req.params;
+  const { for_everyone } = req.body || {};
+  try {
+    const { rows } = await pool.query('SELECT * FROM messages WHERE id=$1', [msgId]);
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    const msg = rows[0];
+    if (for_everyone && msg.sender_id !== req.user.id) {
+      return res.status(403).json({ error: 'Can only delete your own messages for everyone' });
+    }
+    if (for_everyone) {
+      await pool.query('DELETE FROM messages WHERE id=$1', [msgId]);
+      const io_instance = req.app.get('io');
+      if (io_instance) io_instance.to(msg.conversation_id).emit('message:deleted', { message_id: msgId, conversation_id: msg.conversation_id });
+    } else {
+      // For just me - mark as deleted (soft delete)
+      await pool.query('UPDATE messages SET content=$1, type=$2 WHERE id=$3', ['[Message deleted]', 'deleted', msgId]);
+    }
+    res.json({ ok: true });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ─── CLEAR CHAT ───
+app.delete('/api/conversations/:convId/messages', auth, async (req, res) => {
+  const { convId } = req.params;
+  try {
+    const mem = await pool.query('SELECT role FROM conversation_members WHERE conversation_id=$1 AND user_id=$2', [convId, req.user.id]);
+    if (!mem.rows.length) return res.status(403).json({ error: 'Not a member' });
+    await pool.query('DELETE FROM messages WHERE conversation_id=$1', [convId]);
+    const io_instance = req.app.get('io');
+    if (io_instance) io_instance.to(convId).emit('chat:cleared', { conversation_id: convId });
+    res.json({ ok: true });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
