@@ -480,3 +480,28 @@ app.delete('/api/conversations/:convId/messages', auth, async (req, res) => {
     res.json({ ok: true });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
+
+// ─── LEAVE / DELETE CONVERSATION ───
+app.post('/api/conversations/:convId/leave', auth, async (req, res) => {
+  const { convId } = req.params;
+  try {
+    const mem = await pool.query(
+      'SELECT role FROM conversation_members WHERE conversation_id=$1 AND user_id=$2',
+      [convId, req.user.id]
+    );
+    if (!mem.rows.length) return res.status(403).json({ error: 'Not a member' });
+    // Remove user from conversation
+    await pool.query(
+      'DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2',
+      [convId, req.user.id]
+    );
+    // If no members left, delete the conversation
+    const remaining = await pool.query(
+      'SELECT COUNT(*) FROM conversation_members WHERE conversation_id=$1', [convId]
+    );
+    if (parseInt(remaining.rows[0].count) === 0) {
+      await pool.query('DELETE FROM conversations WHERE id=$1', [convId]);
+    }
+    res.json({ ok: true });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
