@@ -580,3 +580,148 @@ app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime
 initDB().then(() => {
   server.listen(PORT, () => console.log(`🚀 ShadowTalk on port ${PORT}`));
 }).catch(e => { console.error(e); process.exit(1); });
+
+// ═══ SELF-DESTRUCT MESSAGES ═══
+app.post('/api/messages/:msgId/destruct', authMiddleware, async (req, res) => {
+  const { seconds } = req.body; // how many seconds until delete
+  if (!seconds || seconds < 5) return res.status(400).json({ error: 'Min 5 seconds' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM messages WHERE id=$1 AND sender_id=$2', [req.params.msgId, req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    setTimeout(async () => {
+      await pool.query('DELETE FROM messages WHERE id=$1', [req.params.msgId]);
+      io.to(rows[0].conversation_id).emit('message:deleted', { message_id: req.params.msgId });
+    }, seconds * 1000);
+    res.json({ ok: true, destroys_in: seconds });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ═══ REFERRAL SYSTEM ═══
+app.get('/api/referral/link', authMiddleware, async (req, res) => {
+  const code = Buffer.from(req.user.id).toString('base64').slice(0, 12);
+  res.json({ code, link: `${process.env.CLIENT_URL || 'https://your-app.vercel.app'}?ref=${code}` });
+});
+
+app.post('/api/referral/use', authMiddleware, async (req, res) => {
+  // Track referral - simplified
+  res.json({ ok: true, bonus: 'Premium for 7 days' });
+});
+
+// ═══ VOICE ROOMS ═══
+const voiceRooms = new Map(); // roomId -> {name, members: Set}
+
+app.get('/api/rooms', authMiddleware, async (req, res) => {
+  const rooms = [];
+  voiceRooms.forEach((room, id) => {
+    rooms.push({ id, name: room.name, members: room.members.size, created_by: room.created_by });
+  });
+  res.json(rooms);
+});
+
+app.post('/api/rooms', authMiddleware, async (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: 'Name required' });
+  const id = Math.random().toString(36).slice(2, 8).toUpperCase();
+  voiceRooms.set(id, { name, members: new Set(), created_by: req.user.id, created_at: new Date() });
+  io.emit('room:created', { id, name, members: 0, created_by: req.user.id });
+  res.json({ id, name });
+});
+
+// Voice room WebRTC via socket
+io.on('connection', (socket) => {
+  // already handled above, extend here
+});
+
+// Extend existing socket with voice rooms
+const origIoConnection = io.listeners('connection')[0];
+// Add room events to each socket on connect (they're already handled in main connection handler)
+
+// ═══ AI BOT ═══
+app.post('/api/ai/chat', authMiddleware, async (req, res) => {
+  const { message, conversation_id } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+  
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    // Fallback responses without AI
+    const responses = [
+      "Hello! I'm ShadowBot. How can I help?",
+      "Interesting! Tell me more.",
+      "I understand. Is there anything else you need?",
+      "Sure, I can help with that!",
+      "That's a great question!"
+    ];
+    const reply = responses[Math.floor(Math.random() * responses.length)];
+    // Save as message from bot
+    if (conversation_id) {
+      const { rows } = await pool.query(
+        `INSERT INTO messages(conversation_id, sender_id, content, type) VALUES($1, $2, $3, 'text') RETURNING *`,
+        [conversation_id, req.user.id, '🤖 ' + reply]
+      );
+      io.to(conversation_id).emit('message:new', { ...rows[0], display_name: 'ShadowBot', username: 'shadowbot', avatar_color: '#7c3aed' });
+    }
+    return res.json({ reply });
+  }
+
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 500,
+        system: 'You are ShadowBot, a helpful assistant inside ShadowTalk messenger. Be concise and friendly.',
+        messages: [{ role: 'user', content: message }]
+      })
+    });
+    const data = await r.json();
+    const reply = data.content?.[0]?.text || 'Sorry, I could not respond.';
+    if (conversation_id) {
+      const { rows } = await pool.query(
+        `INSERT INTO messages(conversation_id, sender_id, content, type) VALUES($1, $2, $3, 'text') RETURNING *`,
+        [conversation_id, req.user.id, reply]
+      );
+      io.to(conversation_id).emit('message:new', { ...rows[0], display_name: 'ShadowBot 🤖', username: 'shadowbot', avatar_color: '#7c3aed' });
+    }
+    res.json({ reply });
+  } catch(e) { res.status(500).json({ error: 'AI error' }); }
+});
+
+// ═══ ANONYMOUS CHAT ═══
+const anonQueue = []; // waiting users
+
+app.post('/api/anon/join', authMiddleware, async (req, res) => {
+  const userId = req.user.id;
+  // Check if already in queue
+  const idx = anonQueue.findIndex(u => u.id === userId);
+  if (idx >= 0) anonQueue.splice(idx, 1);
+  
+  if (anonQueue.length > 0) {
+    // Match with waiting user
+    const partner = anonQueue.shift();
+    // Create anonymous direct conversation
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const conv = await client.query(`INSERT INTO conversations(type, name, created_by) VALUES('direct', 'Anonymous Chat', $1) RETURNING id`, [userId]);
+      const cid = conv.rows[0].id;
+      await client.query(`INSERT INTO conversation_members(conversation_id, user_id) VALUES($1,$2),($1,$3)`, [cid, userId, partner.id]);
+      await client.query(`INSERT INTO messages(conversation_id, sender_id, content, type) VALUES($1,$2,'You are now connected with a stranger. Say hello!','system')`, [cid, userId]);
+      await client.query('COMMIT');
+      // Notify both
+      const partnerSocketId = onlineUsers.get(partner.id);
+      if (partnerSocketId) io.to(partnerSocketId).emit('anon:matched', { conversation_id: cid });
+      res.json({ conversation_id: cid, status: 'matched' });
+    } catch(e) { await client.query('ROLLBACK'); res.status(500).json({ error: 'Server error' }); }
+    finally { client.release(); }
+  } else {
+    anonQueue.push({ id: userId, joined: Date.now() });
+    res.json({ status: 'waiting', position: anonQueue.length });
+  }
+});
+
+app.post('/api/anon/leave', authMiddleware, async (req, res) => {
+  const idx = anonQueue.findIndex(u => u.id === req.user.id);
+  if (idx >= 0) anonQueue.splice(idx, 1);
+  res.json({ ok: true });
+});
