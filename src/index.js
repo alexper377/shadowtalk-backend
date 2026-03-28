@@ -166,6 +166,32 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   res.json(rows[0]);
 });
 
+// ─── UPDATE PROFILE ───
+app.put('/api/auth/profile', authMiddleware, async (req, res) => {
+  const { display_name, bio } = req.body;
+  try {
+    const { rows } = await pool.query(
+      'UPDATE users SET display_name=$1, bio=$2 WHERE id=$3 RETURNING id,username,display_name,avatar_color,bio',
+      [display_name||'', bio||'', req.user.id]
+    );
+    res.json({ user: rows[0] });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ─── UPDATE AVATAR ───
+app.put('/api/auth/avatar', authMiddleware, async (req, res) => {
+  const { avatar_url } = req.body;
+  if (!avatar_url) return res.status(400).json({ error: 'No avatar' });
+  if (avatar_url.length > 2 * 1024 * 1024) return res.status(400).json({ error: 'Avatar too large (max 2MB)' });
+  try {
+    // Add avatar_url column if not exists
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT');
+    await pool.query('UPDATE users SET avatar_url=$1 WHERE id=$2', [avatar_url, req.user.id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+
 // ═══ USERS ═══
 app.get('/api/users/search', authMiddleware, async (req, res) => {
   const q = (req.query.q || '').trim();
