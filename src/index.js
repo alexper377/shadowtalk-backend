@@ -11,6 +11,9 @@ const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'shadowtalk-secret';
 const CLIENT_URL = process.env.CLIENT_URL || '*';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const AI_BOT_USERNAME = 'shadowbot';
+const AI_BOT_NAME = 'ShadowBot 🤖';
+const AI_BOT_COLOR = '#7c3aed';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -124,6 +127,104 @@ function makeToken(user) {
   return jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
 }
 
+async function ensureAiUser(client = pool) {
+  const ex = await client.query(
+    'SELECT id,username,display_name,avatar_color FROM users WHERE username=$1 LIMIT 1',
+    [AI_BOT_USERNAME]
+  );
+  if (ex.rows.length) return ex.rows[0];
+  const { rows } = await client.query(
+    `INSERT INTO users(username,display_name,password_hash,avatar_color,bio)
+     VALUES($1,$2,$3,$4,$5)
+     RETURNING id,username,display_name,avatar_color`,
+    [AI_BOT_USERNAME, AI_BOT_NAME, '!bot-account!', AI_BOT_COLOR, 'AI assistant']
+  );
+  return rows[0];
+}
+
+async function ensureAiDirectConversation(userId) {
+  if (!userId) return null;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const bot = await ensureAiUser(client);
+    const ex = await client.query(`
+      SELECT c.id
+      FROM conversations c
+      JOIN conversation_members cm1 ON cm1.conversation_id=c.id AND cm1.user_id=$1
+      JOIN conversation_members cm2 ON cm2.conversation_id=c.id AND cm2.user_id=$2
+      WHERE c.type='direct'
+      LIMIT 1
+    `, [userId, bot.id]);
+    if (ex.rows.length) {
+      await client.query('COMMIT');
+      return { conversationId: ex.rows[0].id, bot };
+    }
+    const conv = await client.query(
+      `INSERT INTO conversations(type,created_by) VALUES('direct',$1) RETURNING id`,
+      [userId]
+    );
+    const conversationId = conv.rows[0].id;
+    await client.query(
+      `INSERT INTO conversation_members(conversation_id,user_id) VALUES($1,$2),($1,$3)`,
+      [conversationId, userId, bot.id]
+    );
+    await client.query(
+      `INSERT INTO messages(conversation_id,sender_id,content,type) VALUES($1,$2,$3,'system')`,
+      [conversationId, bot.id, 'Hi! I am your AI assistant. Ask me anything.']
+    );
+    await client.query('COMMIT');
+    return { conversationId, bot };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function generateAiReply(message) {
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  if (!GEMINI_API_KEY && !anthropicKey) {
+    const responses = [
+      "Hello! I'm ShadowBot. How can I help?",
+      "Interesting! Tell me more.",
+      "I understand. Is there anything else you need?",
+      "Sure, I can help with that!",
+      "That's a great question!"
+    ];
+    return responses[Math.floor(Math.random() * responses.length)];
+  }
+  let reply = 'Sorry, I could not respond.';
+  if (GEMINI_API_KEY) {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: 'You are ShadowBot, a helpful assistant inside ShadowTalk messenger. Be concise and friendly.' }] },
+        contents: [{ role: 'user', parts: [{ text: message }]}],
+        generationConfig: { maxOutputTokens: 500, temperature: 0.7 }
+      })
+    });
+    const data = await r.json();
+    reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || reply;
+  } else {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 500,
+        system: 'You are ShadowBot, a helpful assistant inside ShadowTalk messenger. Be concise and friendly.',
+        messages: [{ role: 'user', content: message }]
+      })
+    });
+    const data = await r.json();
+    reply = data.content?.[0]?.text || reply;
+  }
+  return reply;
+}
+
 // ═══ AUTH ROUTES ═══
 app.post('/api/auth/register', async (req, res) => {
   const { username, display_name, password } = req.body;
@@ -141,6 +242,7 @@ app.post('/api/auth/register', async (req, res) => {
        RETURNING id,username,display_name,avatar_color,bio,created_at`,
       [username, display_name || username, hash, color]
     );
+    try { await ensureAiDirectConversation(rows[0].id); } catch (e) { console.error('AI chat init failed:', e.message); }
     res.json({ user: rows[0], token: makeToken(rows[0]) });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
@@ -153,12 +255,14 @@ app.post('/api/auth/login', async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     const ok = await bcrypt.compare(password, rows[0].password_hash);
     if (!ok) return res.status(401).json({ error: 'Wrong password' });
+    try { await ensureAiDirectConversation(rows[0].id); } catch (e) { console.error('AI chat init failed:', e.message); }
     delete rows[0].password_hash;
     res.json({ user: rows[0], token: makeToken(rows[0]) });
   } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  try { await ensureAiDirectConversation(req.user.id); } catch (e) { console.error('AI chat init failed:', e.message); }
   const { rows } = await pool.query(
     'SELECT id,username,display_name,avatar_color,bio,is_online,last_seen,created_at FROM users WHERE id=$1',
     [req.user.id]
@@ -564,6 +668,37 @@ io.on('connection', async (socket) => {
       const { rows: sr } = await pool.query('SELECT username,display_name,avatar_color FROM users WHERE id=$1', [userId]);
       const full = { ...rows[0], ...sr[0] };
       io.to(conversation_id).emit('message:new', full);
+
+      // Auto-reply when user writes in personal AI direct chat
+      if (type === 'text' && content?.trim()) {
+        const { rows: botRows } = await pool.query(
+          `SELECT u.id,u.username,u.display_name,u.avatar_color
+           FROM conversation_members cm
+           JOIN users u ON u.id=cm.user_id
+           WHERE cm.conversation_id=$1 AND u.username=$2
+           LIMIT 1`,
+          [conversation_id, AI_BOT_USERNAME]
+        );
+        if (botRows.length && botRows[0].id !== userId) {
+          try {
+            const reply = await generateAiReply(content.trim());
+            const { rows: aiMsgRows } = await pool.query(
+              `INSERT INTO messages(conversation_id,sender_id,content,type)
+               VALUES($1,$2,$3,'text')
+               RETURNING id,conversation_id,sender_id,content,type,file_name,file_size,file_data,reply_to_id,reply_to_content,reply_to_user,is_read,created_at`,
+              [conversation_id, botRows[0].id, reply]
+            );
+            io.to(conversation_id).emit('message:new', {
+              ...aiMsgRows[0],
+              username: botRows[0].username,
+              display_name: botRows[0].display_name,
+              avatar_color: botRows[0].avatar_color,
+            });
+          } catch (aiErr) {
+            console.error('AI auto-reply failed:', aiErr);
+          }
+        }
+      }
       if (ack) ack({ ok: true, message: full });
     } catch(e) { console.error(e); if (ack) ack({ ok: false }); }
   });
@@ -667,63 +802,15 @@ const origIoConnection = io.listeners('connection')[0];
 app.post('/api/ai/chat', authMiddleware, async (req, res) => {
   const { message, conversation_id } = req.body;
   if (!message) return res.status(400).json({ error: 'Message required' });
-  
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
-  if (!GEMINI_API_KEY && !anthropicKey) {
-    // Fallback responses without AI
-    const responses = [
-      "Hello! I'm ShadowBot. How can I help?",
-      "Interesting! Tell me more.",
-      "I understand. Is there anything else you need?",
-      "Sure, I can help with that!",
-      "That's a great question!"
-    ];
-    const reply = responses[Math.floor(Math.random() * responses.length)];
-    // Save as message from bot
-    if (conversation_id) {
-      const { rows } = await pool.query(
-        `INSERT INTO messages(conversation_id, sender_id, content, type) VALUES($1, $2, $3, 'text') RETURNING *`,
-        [conversation_id, req.user.id, '🤖 ' + reply]
-      );
-      io.to(conversation_id).emit('message:new', { ...rows[0], display_name: 'ShadowBot', username: 'shadowbot', avatar_color: '#7c3aed' });
-    }
-    return res.json({ reply });
-  }
-
   try {
-    let reply = 'Sorry, I could not respond.';
-    if (GEMINI_API_KEY) {
-      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: 'You are ShadowBot, a helpful assistant inside ShadowTalk messenger. Be concise and friendly.' }] },
-          contents: [{ role: 'user', parts: [{ text: message }]}],
-          generationConfig: { maxOutputTokens: 500, temperature: 0.7 }
-        })
-      });
-      const data = await r.json();
-      reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || reply;
-    } else {
-      const r = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 500,
-          system: 'You are ShadowBot, a helpful assistant inside ShadowTalk messenger. Be concise and friendly.',
-          messages: [{ role: 'user', content: message }]
-        })
-      });
-      const data = await r.json();
-      reply = data.content?.[0]?.text || reply;
-    }
+    const reply = await generateAiReply(message);
     if (conversation_id) {
+      const bot = await ensureAiUser();
       const { rows } = await pool.query(
         `INSERT INTO messages(conversation_id, sender_id, content, type) VALUES($1, $2, $3, 'text') RETURNING *`,
-        [conversation_id, req.user.id, reply]
+        [conversation_id, bot.id, reply]
       );
-      io.to(conversation_id).emit('message:new', { ...rows[0], display_name: 'ShadowBot 🤖', username: 'shadowbot', avatar_color: '#7c3aed' });
+      io.to(conversation_id).emit('message:new', { ...rows[0], display_name: bot.display_name, username: bot.username, avatar_color: bot.avatar_color });
     }
     res.json({ reply });
   } catch(e) { res.status(500).json({ error: 'AI error' }); }
