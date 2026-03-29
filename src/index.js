@@ -197,30 +197,60 @@ async function generateAiReply(message) {
   }
   let reply = 'Sorry, I could not respond.';
   if (GEMINI_API_KEY) {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: 'You are ShadowBot, a helpful assistant inside ShadowTalk messenger. Be concise and friendly.' }] },
-        contents: [{ role: 'user', parts: [{ text: message }]}],
-        generationConfig: { maxOutputTokens: 500, temperature: 0.7 }
-      })
-    });
-    const data = await r.json();
-    reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || reply;
+    const payload = {
+      systemInstruction: { parts: [{ text: 'You are ShadowBot, a helpful assistant inside ShadowTalk messenger. Be concise and friendly.' }] },
+      contents: [{ role: 'user', parts: [{ text: message }]}],
+      generationConfig: { maxOutputTokens: 500, temperature: 0.7 }
+    };
+    const models = ['gemini-1.5-flash', 'gemini-1.5-pro'];
+    let lastGeminiError = '';
+    for (const model of models) {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await r.json().catch(() => ({}));
+      if (r.ok) {
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text && text.trim()) {
+          reply = text.trim();
+          lastGeminiError = '';
+          break;
+        }
+        lastGeminiError = 'Empty response from Gemini';
+      } else {
+        lastGeminiError = data?.error?.message || `Gemini HTTP ${r.status}`;
+      }
+    }
+    if (lastGeminiError) {
+      console.error('Gemini error:', lastGeminiError);
+      if (!anthropicKey) {
+        return 'AI временно недоступен. Проверьте GEMINI_API_KEY в Railway Variables.';
+      }
+    } else {
+      return reply;
+    }
+  }
+  if (anthropicKey) {
+    try {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 500,
+          system: 'You are ShadowBot, a helpful assistant inside ShadowTalk messenger. Be concise and friendly.',
+          messages: [{ role: 'user', content: message }]
+        })
+      });
+      const data = await r.json().catch(() => ({}));
+      reply = data?.content?.[0]?.text || reply;
+    } catch (e) {
+      console.error('Anthropic error:', e.message);
+    }
   } else {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 500,
-        system: 'You are ShadowBot, a helpful assistant inside ShadowTalk messenger. Be concise and friendly.',
-        messages: [{ role: 'user', content: message }]
-      })
-    });
-    const data = await r.json();
-    reply = data.content?.[0]?.text || reply;
+    return reply;
   }
   return reply;
 }
