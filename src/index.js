@@ -202,7 +202,7 @@ async function generateAiReply(message) {
       contents: [{ role: 'user', parts: [{ text: message }]}],
       generationConfig: { maxOutputTokens: 500, temperature: 0.7 }
     };
-    const models = ['gemini-1.5-flash', 'gemini-1.5-pro'];
+    const models = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'];
     let lastGeminiError = '';
     for (const model of models) {
       const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
@@ -220,13 +220,14 @@ async function generateAiReply(message) {
         }
         lastGeminiError = 'Empty response from Gemini';
       } else {
-        lastGeminiError = data?.error?.message || `Gemini HTTP ${r.status}`;
+        const msg = data?.error?.message || 'Unknown Gemini error';
+        lastGeminiError = `model=${model}; http=${r.status}; ${msg}`;
       }
     }
     if (lastGeminiError) {
       console.error('Gemini error:', lastGeminiError);
       if (!anthropicKey) {
-        return 'AI временно недоступен. Проверьте GEMINI_API_KEY в Railway Variables.';
+        return `AI Gemini error: ${lastGeminiError}`;
       }
     } else {
       return reply;
