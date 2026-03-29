@@ -10,6 +10,7 @@ const jwt = require('jsonwebtoken');
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'shadowtalk-secret';
 const CLIENT_URL = process.env.CLIENT_URL || '*';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -190,7 +191,6 @@ app.put('/api/auth/avatar', authMiddleware, async (req, res) => {
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
-
 
 // ═══ USERS ═══
 app.get('/api/users/search', authMiddleware, async (req, res) => {
@@ -625,7 +625,8 @@ app.post('/api/messages/:msgId/destruct', authMiddleware, async (req, res) => {
 // ═══ REFERRAL SYSTEM ═══
 app.get('/api/referral/link', authMiddleware, async (req, res) => {
   const code = Buffer.from(req.user.id).toString('base64').slice(0, 12);
-  res.json({ code, link: `${process.env.CLIENT_URL || 'https://your-app.vercel.app'}?ref=${code}` });
+  const base = process.env.CLIENT_URL || '';
+  res.json({ code, link: base ? `${base}?ref=${code}` : code });
 });
 
 app.post('/api/referral/use', authMiddleware, async (req, res) => {
@@ -667,8 +668,8 @@ app.post('/api/ai/chat', authMiddleware, async (req, res) => {
   const { message, conversation_id } = req.body;
   if (!message) return res.status(400).json({ error: 'Message required' });
   
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  if (!GEMINI_API_KEY && !anthropicKey) {
     // Fallback responses without AI
     const responses = [
       "Hello! I'm ShadowBot. How can I help?",
@@ -690,18 +691,33 @@ app.post('/api/ai/chat', authMiddleware, async (req, res) => {
   }
 
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 500,
-        system: 'You are ShadowBot, a helpful assistant inside ShadowTalk messenger. Be concise and friendly.',
-        messages: [{ role: 'user', content: message }]
-      })
-    });
-    const data = await r.json();
-    const reply = data.content?.[0]?.text || 'Sorry, I could not respond.';
+    let reply = 'Sorry, I could not respond.';
+    if (GEMINI_API_KEY) {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: 'You are ShadowBot, a helpful assistant inside ShadowTalk messenger. Be concise and friendly.' }] },
+          contents: [{ role: 'user', parts: [{ text: message }]}],
+          generationConfig: { maxOutputTokens: 500, temperature: 0.7 }
+        })
+      });
+      const data = await r.json();
+      reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || reply;
+    } else {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': anthropicKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 500,
+          system: 'You are ShadowBot, a helpful assistant inside ShadowTalk messenger. Be concise and friendly.',
+          messages: [{ role: 'user', content: message }]
+        })
+      });
+      const data = await r.json();
+      reply = data.content?.[0]?.text || reply;
+    }
     if (conversation_id) {
       const { rows } = await pool.query(
         `INSERT INTO messages(conversation_id, sender_id, content, type) VALUES($1, $2, $3, 'text') RETURNING *`,
