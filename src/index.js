@@ -202,7 +202,22 @@ async function generateAiReply(message) {
       contents: [{ role: 'user', parts: [{ text: message }]}],
       generationConfig: { maxOutputTokens: 500, temperature: 0.7 }
     };
-    const models = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'];
+    let models = ['gemini-2.0-flash', 'gemini-1.5-flash'];
+    try {
+      const lr = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(GEMINI_API_KEY)}`);
+      const ld = await lr.json().catch(() => ({}));
+      if (lr.ok && Array.isArray(ld.models)) {
+        const available = ld.models
+          .filter((m) => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+          .map((m) => String(m.name || '').replace(/^models\//, ''))
+          .filter(Boolean);
+        const preferredOrder = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-flash-latest'];
+        const preferred = preferredOrder.filter((p) => available.includes(p));
+        const rest = available.filter((m) => !preferred.includes(m) && m.toLowerCase().includes('gemini'));
+        models = [...preferred, ...rest];
+      }
+    } catch (_) {}
+    if (!models.length) models = ['gemini-1.5-flash-latest'];
     let lastGeminiError = '';
     for (const model of models) {
       const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
